@@ -1,0 +1,29 @@
+package postgresql-libpq
+  flags: +use-pkg-config
+  extra-include-dirs:
+    /opt/homebrew/opt/libpq/include,
+    /opt/homebrew/opt/openssl@3/include
+  extra-lib-dirs:
+    /opt/homebrew/opt/libpq/lib,
+    /opt/homebrew/opt/openssl@3/lib
+  ld-options:
+    -Wl,-rpath,/opt/homebrew/opt/libpq/lib
+    -Wl,-rpath,/opt/homebrew/opt/openssl@3/lib
+
+package postgresql-simple
+  flags: +use-pkg-config
+  extra-include-dirs:
+    /opt/homebrew/opt/libpq/include,
+    /opt/homebrew/opt/openssl@3/include
+  extra-lib-dirs:
+    /opt/homebrew/opt/libpq/lib,
+    /opt/homebrew/opt/openssl@3/lib
+  ld-options:
+    -Wl,-rpath,/opt/homebrew/opt/libpq/lib
+    -Wl,-rpath,/opt/homebrew/opt/openssl@3/lib
+
+package lab1
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N
+  ld-options:
+    -Wl,-rpath,/opt/homebrew/opt/libpq/lib
+    -Wl,-rpath,/opt/homebrew/opt/openssl@3/lib
