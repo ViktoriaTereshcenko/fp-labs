@@ -298,8 +298,8 @@ createConn :: IO Connection
 createConn = do
   host <- readEnv "PGHOST"     "127.0.0.1"
   port <- readEnvPort "PGPORT" 5432
-  user <- readEnv "PGUSER"     "$(whoami)"
-  pass <- readEnv "PGPASSWORD" "password"
+  user <- readEnv "PGUSER"     "vikilinater"
+  pass <- readEnv "PGPASSWORD" "admin"
   db   <- readEnv "PGDATABASE" "faculty_sport"
   connect defaultConnectInfo
     { connectHost     = host
