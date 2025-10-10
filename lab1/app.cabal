@@ -32,7 +32,6 @@ executable lab1
     , bytestring
     , text
     , time
-    , aeson
-    , containers
-    , postgresql-simple >=0.6
     , directory
+    , postgresql-simple >=0.6
+    , ansi-terminal >=0.11 && <1.1
