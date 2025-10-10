@@ -5,10 +5,13 @@
 
 module Main where
 
+import           Control.Exception (bracket, try, SomeException)
 import           Control.Monad (void, when)
+import           Data.Char (toLower)
 import           Data.Int (Int64)
 import           Data.Maybe (fromMaybe)
-import           Data.Time (Day, defaultTimeLocale, parseTimeM)
+import           Data.Time (Day, defaultTimeLocale, parseTimeM, formatTime)
+import           Data.Time.Calendar (fromGregorian)
 import           Data.Time.LocalTime (TimeOfDay(..))
 import           Data.Text (Text)
 import qualified Data.Text as T
@@ -24,6 +27,12 @@ import           System.Environment (lookupEnv)
 import           Data.Word (Word16)
 import           Text.Read (readMaybe)
 
+-- ANSI (кольори/стиль)
+import           System.Console.ANSI (hSupportsANSI, setSGR,
+                 SGR(SetColor, SetConsoleIntensity, Reset),
+                 ColorIntensity(Vivid), ConsoleIntensity(BoldIntensity),
+                 ConsoleLayer(Foreground), Color(Cyan, Green))
+
 -- PostgreSQL
 import           Database.PostgreSQL.Simple
 import           Database.PostgreSQL.Simple.FromRow
@@ -31,6 +40,74 @@ import           Database.PostgreSQL.Simple.ToRow
 import           Database.PostgreSQL.Simple.ToField (ToField, toField)
 import           Database.PostgreSQL.Simple.Transaction (withTransaction)
 import           Database.PostgreSQL.Simple.Types (Query(..))
+
+--------------------------------------------------------------------------------
+-- УТИЛІТИ ДЛЯ ПРИНТУ / UI
+--------------------------------------------------------------------------------
+
+dash :: Text
+dash = "—"
+
+tMaybe :: Maybe Text -> Text
+tMaybe = fromMaybe dash
+
+fmtTime :: TimeOfDay -> Text
+fmtTime (TimeOfDay h m _) =
+  let two n = if n < 10 then '0':show n else show n
+  in T.pack (two h <> ":" <> two m)
+
+fmtDay :: Day -> Text
+fmtDay d = T.pack (formatTime defaultTimeLocale "%F" d)
+
+sayChanged :: String -> Int64 -> IO ()
+sayChanged action n =
+  putStrLn $ (if n == 0 then "Нічого не змінено (" else action ++ ": ") ++ show n ++ (if n==0 then ")" else "")
+
+sayEmptyIf :: Bool -> IO ()
+sayEmptyIf isEmpty = when isEmpty (putStrLn "(порожньо)")
+
+withHeader :: Text -> IO a -> IO a
+withHeader title action = do
+  ansi <- hSupportsANSI stdout
+  when ansi (setSGR [SetColor Foreground Vivid Cyan, SetConsoleIntensity BoldIntensity])
+  TIO.putStrLn ("\n" <> title)
+  when ansi (setSGR [Reset])
+  action
+
+padR :: Int -> Text -> Text
+padR w t =
+  let len = T.length t
+  in if len >= w then t else t <> T.replicate (w - len) " "
+
+truncateEll :: Int -> Text -> Text
+truncateEll w t = if T.length t <= w then t else T.take (max 1 (w-1)) t <> "…"
+
+fitCols :: Int -> [Text] -> [Text]
+fitCols n xs = take n (xs ++ repeat "")
+
+printTable :: [Text] -> [[Text]] -> IO ()
+printTable headers rows = do
+  let nCols   = length headers
+      rows'   = map (fitCols nCols) rows
+      initW   = map T.length headers
+      grow ws xs = zipWith max ws (map T.length xs)
+      widths  = foldl grow initW rows'
+      fitRow xs = zipWith (\w x -> padR w (truncateEll w x)) widths xs
+      sep     = T.intercalate "-+-" [ T.replicate w "-" | w <- widths ]
+  -- header
+  ansi <- hSupportsANSI stdout
+  when ansi (setSGR [SetColor Foreground Vivid Cyan, SetConsoleIntensity BoldIntensity])
+  TIO.putStrLn (T.intercalate " | " (fitRow headers))
+  when ansi (setSGR [Reset])
+  TIO.putStrLn sep
+  -- rows
+  mapM_ (TIO.putStrLn . T.intercalate " | " . fitRow) rows'
+
+confirm :: String -> IO Bool
+confirm msg = do
+  putStr (msg ++ " [y/yes/т/так, default=N]: ") >> hFlush stdout
+  ans <- fmap (map toLower . dropWhile (==' ') . reverse . dropWhile (==' ') . reverse) getLine
+  pure (ans `elem` ["y","yes","т","так"])
 
 --------------------------------------------------------------------------------
 -- МОДЕЛІ
@@ -177,7 +254,7 @@ instance Persist Section where
   tableName _     = "sections"
   insertSQL _     = "INSERT INTO sections (name, level, instructor_id) VALUES (?,?,?)"
   updateSQL _     = "UPDATE sections SET name=?, level=?, instructor_id=? WHERE section_id=?"
-  selectAllSQL _  = "SELECT section_id, name, level, instructor_id FROM sections ORDER BY name"
+  selectAllSQL _  = "SELECT section_id, name, level::text, instructor_id FROM sections ORDER BY name"
   deleteSQL _     = "DELETE FROM sections WHERE section_id=?"
   getKey          = secId
 
@@ -188,11 +265,11 @@ instance Persist Schedule where
   insertSQL _     = "INSERT INTO section_schedule (section_id, weekday, start_time, end_time, location) VALUES (?,?,?,?,?)"
   updateSQL _     = "UPDATE section_schedule SET section_id=?, weekday=?, start_time=?, end_time=?, location=? WHERE schedule_id=?"
   selectAllSQL _  =
-    "SELECT schedule_id, section_id, weekday, start_time, end_time, location \
+    "SELECT schedule_id, section_id, weekday::text, start_time, end_time, location \
     \FROM section_schedule \
     \ORDER BY section_id, \
-    \CASE weekday WHEN 'Mon' THEN 1 WHEN 'Tue' THEN 2 WHEN 'Wed' THEN 3 \
-    \WHEN 'Thu' THEN 4 WHEN 'Fri' THEN 5 WHEN 'Sat' THEN 6 WHEN 'Sun' THEN 7 END, \
+    \CASE weekday WHEN 'Пн' THEN 1 WHEN 'Вт' THEN 2 WHEN 'Ср' THEN 3 \
+    \WHEN 'Чт' THEN 4 WHEN 'Пт' THEN 5 WHEN 'Сб' THEN 6 WHEN 'Нд' THEN 7 END, \
     \start_time"
   deleteSQL _     = "DELETE FROM section_schedule WHERE schedule_id=?"
   getKey          = schId
@@ -248,74 +325,54 @@ selectAll :: (Persist a, FromRow a) => Connection -> a -> IO [a]
 selectAll conn proxy = query_ conn (selectAllSQL proxy)
 
 --------------------------------------------------------------------------------
--- PRETTY-ВИВІД (для коректного UTF-8 замість Show-escape)
+-- PRETTY-ВИВІД (строкові представлення)
 --------------------------------------------------------------------------------
 
-prettyStudent :: Student -> Text
+prettyStudent :: Student -> [Text]
 prettyStudent s =
-  T.intercalate " | "
-    [ "ID: " <> maybe "-" (T.pack . show) (stId s)
-    , "ПІБ: " <> stLastName s <> " " <> stFirstName s
-    , "Група: " <> stGroup s
-    , "Нар.: " <> T.pack (show (stBirth s))
-    , "Тел: " <> maybe "" id (stPhone s)
-    ]
+  [ maybe "-" (T.pack . show) (stId s)
+  , stLastName s <> " " <> stFirstName s
+  , stGroup s
+  , fmtDay (stBirth s)
+  , tMaybe (stPhone s)
+  ]
 
-prettyInstructor :: Instructor -> Text
+prettyInstructor :: Instructor -> [Text]
 prettyInstructor i =
-  T.intercalate " | "
-    [ "ID: " <> maybe "-" (T.pack . show) (insId i)
-    , "ПІБ: " <> insLastName i <> " " <> insFirstName i
-    , "Кафедра: " <> insDept i
-    , "Тел: " <> maybe "" id (insPhone i)
-    ]
+  [ maybe "-" (T.pack . show) (insId i)
+  , insLastName i <> " " <> insFirstName i
+  , insDept i
+  , tMaybe (insPhone i)
+  ]
 
-prettySection :: Section -> Text
+prettySection :: Section -> [Text]
 prettySection s =
-  T.intercalate " | "
-    [ "ID: " <> maybe "-" (T.pack . show) (secId s)
-    , "Назва: " <> secName s
-    , "Рівень: " <> secLevel s
-    , "Викл.ID: " <> maybe "-" (T.pack . show) (secInstructor s)
-    ]
+  [ maybe "-" (T.pack . show) (secId s)
+  , secName s
+  , secLevel s
+  , maybe "-" (T.pack . show) (secInstructor s)
+  ]
 
-prettySchedule :: Schedule -> Text
-prettySchedule s =
-  T.intercalate " | "
-    [ "ID: " <> maybe "-" (T.pack . show) (schId s)
-    , "Секція: " <> T.pack (show (schSection s))
-    , "День: " <> schWeekday s
-    , "Час: " <> T.pack (show (schStart s)) <> "-" <> T.pack (show (schEnd s))
-    , "Локація: " <> schLoc s
-    ]
+prettyScheduleRow :: (Int, Text, Text, Text, Text, Text) -> [Text]
+prettyScheduleRow (sid, sname, w, st, en, loc) =
+  [ T.pack (show sid)
+  , sname
+  , w
+  , st <> "–" <> en
+  , loc
+  ]
 
-prettyMembership :: Membership -> Text
-prettyMembership m =
-  T.intercalate " | "
-    [ "ID: " <> maybe "-" (T.pack . show) (memId m)
-    , "СтудентID: " <> T.pack (show (memStudent m))
-    , "СекціяID: " <> T.pack (show (memSection m))
-    , "Вступ: " <> T.pack (show (memJoined m))
-    ]
+prettyMembershipRow :: (Int, Text, Text, Day) -> [Text]
+prettyMembershipRow (mid, sname, secname, d) =
+  [ T.pack (show mid), sname, secname, fmtDay d ]
 
-prettyCompetition :: Competition -> Text
-prettyCompetition c =
-  T.intercalate " | "
-    [ "ID: " <> maybe "-" (T.pack . show) (cmpId c)
-    , "Назва: " <> cmpTitle c
-    , "Дата: " <> T.pack (show (cmpHeldOn c))
-    , "Місце: " <> cmpVenue c
-    , "СекціяID: " <> maybe "-" (T.pack . show) (cmpSection c)
-    ]
+prettyCompetitionRow :: (Int, Text, Day, Text, Text) -> [Text]
+prettyCompetitionRow (cid, title, heldOn, venue, secName) =
+  [ T.pack (show cid), title, fmtDay heldOn, venue, secName ]
 
-prettyCompetitionParticipant :: CompetitionParticipant -> Text
-prettyCompetitionParticipant cp =
-  T.intercalate " | "
-    [ "ID: " <> maybe "-" (T.pack . show) (cpId cp)
-    , "ЗмаганняID: " <> T.pack (show (cpCompetition cp))
-    , "СтудентID: " <> T.pack (show (cpStudent cp))
-    , "Нотатки: " <> maybe "" id (cpResultNotes cp)
-    ]
+prettyCPRow :: (Int, Text, Text, Maybe Text) -> [Text]
+prettyCPRow (cid, ctitle, sname, notes) =
+  [ T.pack (show cid), ctitle, sname, tMaybe notes ]
 
 --------------------------------------------------------------------------------
 -- СПЕЦІАЛЬНІ ЗАПИТИ (JOIN-и)
@@ -324,26 +381,26 @@ prettyCompetitionParticipant cp =
 -- 1) Студент -> секції
 listStudentSections :: Connection -> IO [(Text, Text)]
 listStudentSections conn = query_ conn
-  "SELECT (s.first_name || ' ' || s.last_name) AS student, sec.name \
+  "SELECT (s.last_name || ' ' || s.first_name) AS student, sec.name \
   \FROM memberships m \
   \JOIN students s ON s.student_id=m.student_id \
   \JOIN sections sec ON sec.section_id=m.section_id \
   \ORDER BY student, sec.name"
 
--- 2) Розклад конкретної секції (Mon..Sun)
+-- 2) Розклад конкретної секції
 getSectionSchedule :: Connection -> Int -> IO [(Text, Text, Text)]
 getSectionSchedule conn sid = query conn
   "SELECT weekday::text, to_char(start_time,'HH24:MI'), to_char(end_time,'HH24:MI') \
   \FROM section_schedule \
   \WHERE section_id=? \
-  \ORDER BY CASE weekday WHEN 'Mon' THEN 1 WHEN 'Tue' THEN 2 WHEN 'Wed' THEN 3 \
-  \WHEN 'Thu' THEN 4 WHEN 'Fri' THEN 5 WHEN 'Sat' THEN 6 WHEN 'Sun' THEN 7 END, start_time"
+  \ORDER BY CASE weekday WHEN 'Пн' THEN 1 WHEN 'Вт' THEN 2 WHEN 'Ср' THEN 3 \
+  \WHEN 'Чт' THEN 4 WHEN 'Пт' THEN 5 WHEN 'Сб' THEN 6 WHEN 'Нд' THEN 7 END, start_time"
   (Only sid)
 
 -- 3) Учасники змагання
 listCompetitionParticipants :: Connection -> Int -> IO [(Text, Text)]
 listCompetitionParticipants conn cid = query conn
-  "SELECT c.title, (s.first_name || ' ' || s.last_name) AS student \
+  "SELECT c.title, (s.last_name || ' ' || s.first_name) AS student \
   \FROM competition_participants cp \
   \JOIN competitions c ON c.competition_id = cp.competition_id \
   \JOIN students s ON s.student_id = cp.student_id \
@@ -356,6 +413,8 @@ listCompetitionParticipants conn cid = query conn
 
 runMigrations :: Connection -> IO ()
 runMigrations conn = do
+  -- приглушимо NOTICE-и
+  void (execute_ conn "SET client_min_messages = WARNING")
   ok <- doesFileExist "db.sql"
   when ok $ do
     raw <- SBS.readFile "db.sql"
@@ -369,10 +428,13 @@ runMigrations conn = do
            || s' == "begin;"
            || s' == "commit;"
         cleaned = T.unlines (filter (not . isForbidden) (T.lines txt))
-    -- виконуємо тільки якщо щось лишилось
-    when (not (T.null (T.strip cleaned))) $
-      withTransaction conn $
-        void (execute_ conn (Query (TE.encodeUtf8 cleaned)))
+    when (not (T.null (T.strip cleaned))) $ do
+      res <- try (withTransaction conn $
+                    void (execute_ conn (Query (TE.encodeUtf8 cleaned)))
+                 ) :: IO (Either SomeException ())
+      case res of
+        Left e  -> putStrLn $ "Помилка міграції: " ++ show e
+        Right _ -> pure ()
 
 --------------------------------------------------------------------------------
 -- ПІДКЛЮЧЕННЯ ДО PostgreSQL
@@ -440,10 +502,10 @@ promptFromOptionsCI label options = do
     Nothing    -> putStrLn "Невірне значення. Спробуй ще." >> promptFromOptionsCI label options
 
 promptLevel :: IO Text
-promptLevel = promptFromOptionsCI "Рівень" ["beginner","intermediate","advanced"]
+promptLevel = promptFromOptionsCI "Рівень" ["початковий","середній","просунутий"]
 
 promptWeekday :: IO Text
-promptWeekday = promptFromOptionsCI "День тижня" ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+promptWeekday = promptFromOptionsCI "День тижня" ["Пн","Вт","Ср","Чт","Пт","Сб","Нд"]
 
 readTimeOfDay :: String -> IO TimeOfDay
 readTimeOfDay label = do
@@ -466,6 +528,9 @@ readTimeOfDay label = do
 -- CLI-ОПЕРАЦІЇ
 --------------------------------------------------------------------------------
 
+dummyDay :: Day
+dummyDay = fromGregorian 2000 1 1
+
 -- STUDENT
 addStudent :: Connection -> IO ()
 addStudent conn = do
@@ -473,34 +538,45 @@ addStudent conn = do
   l  <- T.pack <$> prompt "Прізвище"
   g  <- T.pack <$> prompt "Група (напр. КН-21)"
   b  <- promptDay "Дата народження"
-  pS <- prompt "Телефон (необов'язково, Enter=порожньо)"
+  pS <- prompt "Телефон (Enter = NULL)"
   let p = if null pS then Nothing else Just (T.pack pS)
-  let st = Student Nothing f l g b p
-  n <- insertEntity conn st
-  putStrLn $ "Додано студентів: " ++ show n
+  n <- insertEntity conn (Student Nothing f l g b p)
+  sayChanged "Додано студентів" n
 
 viewStudents :: Connection -> IO ()
 viewStudents conn = do
-  xs <- selectAll conn (Student Nothing "" "" "" (read "2000-01-01") Nothing)
-  mapM_ (TIO.putStrLn . prettyStudent) xs
+  xs <- selectAll conn (Student Nothing "" "" "" dummyDay Nothing)
+  withHeader "Студенти (відсортовано за прізвищем, ім’ям)" $ do
+    sayEmptyIf (null xs)
+    let headers = ["ID","ПІБ","Група","Нар.","Тел"]
+        rows    = map (\s -> [ maybe "-" (T.pack . show) (stId s)
+                             , stLastName s <> " " <> stFirstName s
+                             , stGroup s
+                             , T.pack (show (stBirth s))
+                             , maybe "—" id (stPhone s)
+                             ]) xs
+    printTable headers rows
 
 updateStudent :: Connection -> IO ()
 updateStudent conn = do
-  sid <- promptInt "ID студента для оновлення"
+  sid <- promptInt "Вкажіть ID студента для оновлення"
   f   <- T.pack <$> prompt "Нове ім'я"
   l   <- T.pack <$> prompt "Нове прізвище"
   g   <- T.pack <$> prompt "Нова група"
   b   <- promptDay "Нова дата народження"
-  pS  <- prompt "Новий телефон (Enter=порожньо)"
+  pS  <- prompt "Новий телефон (Enter = NULL)"
   let p = if null pS then Nothing else Just (T.pack pS)
   n <- updateEntity conn (Student (Just sid) f l g b p)
-  putStrLn $ "Оновлено записів: " ++ show n
+  sayChanged "Оновлено записів" n
 
 deleteStudent :: Connection -> IO ()
 deleteStudent conn = do
-  sid <- promptInt "ID студента для видалення"
-  n <- deleteEntity conn (Student (Just sid) "" "" "" (read "2000-01-01") Nothing)
-  putStrLn $ "Видалено записів: " ++ show n
+  sid <- promptInt "Вкажіть ID студента для видалення"
+  ok <- confirm ("Видалити студента #" <> show sid <> "?")
+  if ok
+    then do n <- deleteEntity conn (Student (Just sid) "" "" "" dummyDay Nothing)
+            sayChanged "Видалено записів" n
+    else putStrLn "Скасовано."
 
 -- INSTRUCTOR
 addInstructor :: Connection -> IO ()
@@ -508,124 +584,187 @@ addInstructor conn = do
   f  <- T.pack <$> prompt "Ім'я викладача"
   l  <- T.pack <$> prompt "Прізвище викладача"
   d  <- T.pack <$> prompt "Кафедра/відділ"
-  pS <- prompt "Телефон (Enter=порожньо)"
+  pS <- prompt "Телефон (Enter = NULL)"
   let p = if null pS then Nothing else Just (T.pack pS)
   n <- insertEntity conn (Instructor Nothing f l d p)
-  putStrLn $ "Додано викладачів: " ++ show n
+  sayChanged "Додано викладачів" n
 
 viewInstructors :: Connection -> IO ()
 viewInstructors conn = do
   xs <- selectAll conn (Instructor Nothing "" "" "" Nothing)
-  mapM_ (TIO.putStrLn . prettyInstructor) xs
+  withHeader "Викладачі (відсортовано за прізвищем, ім’ям)" $ do
+    sayEmptyIf (null xs)
+    let headers = ["ID","ПІБ","Кафедра","Тел"]
+        rows    = map (\i -> [ maybe "-" (T.pack . show) (insId i)
+                             , insLastName i <> " " <> insFirstName i
+                             , insDept i
+                             , maybe "—" id (insPhone i)
+                             ]) xs
+    printTable headers rows
 
 updateInstructor :: Connection -> IO ()
 updateInstructor conn = do
-  iid <- promptInt "ID викладача для оновлення"
+  iid <- promptInt "Вкажіть ID викладача для оновлення"
   f   <- T.pack <$> prompt "Нове ім'я"
   l   <- T.pack <$> prompt "Нове прізвище"
   d   <- T.pack <$> prompt "Нова кафедра/відділ"
-  pS  <- prompt "Новий телефон (Enter=порожньо)"
+  pS  <- prompt "Новий телефон (Enter = NULL)"
   let p = if null pS then Nothing else Just (T.pack pS)
   n <- updateEntity conn (Instructor (Just iid) f l d p)
-  putStrLn $ "Оновлено: " ++ show n
+  sayChanged "Оновлено" n
 
 deleteInstructor :: Connection -> IO ()
 deleteInstructor conn = do
-  iid <- promptInt "ID викладача для видалення"
-  n <- deleteEntity conn (Instructor (Just iid) "" "" "" Nothing)
-  putStrLn $ "Видалено: " ++ show n
+  iid <- promptInt "Вкажіть ID викладача для видалення"
+  ok <- confirm ("Видалити викладача #" <> show iid <> "?")
+  if ok
+    then do n <- deleteEntity conn (Instructor (Just iid) "" "" "" Nothing)
+            sayChanged "Видалено" n
+    else putStrLn "Скасовано."
 
 -- SECTION
 addSection :: Connection -> IO ()
 addSection conn = do
-  n   <- T.pack <$> prompt "Назва секції (напр. Basketball)"
+  n   <- T.pack <$> prompt "Назва секції (напр. Баскетбол)"
   lvl <- promptLevel
-  mid <- promptMaybeInt "ID інструктора"
+  mid <- promptMaybeInt "Вкажіть ID викладача (Enter = NULL)"
   nIns <- insertEntity conn (Section Nothing n lvl mid)
-  putStrLn $ "Додано секцій: " ++ show nIns
+  sayChanged "Додано секцій" nIns
 
 viewSections :: Connection -> IO ()
 viewSections conn = do
   xs <- selectAll conn (Section Nothing "" "" Nothing)
-  mapM_ (TIO.putStrLn . prettySection) xs
+  withHeader "Секції (відсортовано за назвою)" $ do
+    sayEmptyIf (null xs)
+    let headers = ["ID","Назва","Рівень","Викл.ID"]
+        rows    = map (\s -> [ maybe "-" (T.pack . show) (secId s)
+                             , secName s
+                             , secLevel s
+                             , maybe "-" (T.pack . show) (secInstructor s)
+                             ]) xs
+    printTable headers rows
 
 updateSection :: Connection -> IO ()
 updateSection conn = do
-  sid <- promptInt "ID секції для оновлення"
+  sid <- promptInt "Вкажіть ID секції для оновлення"
   n   <- T.pack <$> prompt "Нова назва"
   lvl <- promptLevel
-  mid <- promptMaybeInt "Новий ID інструктора"
+  mid <- promptMaybeInt "Новий ID викладача (Enter = NULL)"
   let s = Section (Just sid) n lvl mid
   n' <- updateEntity conn s
-  putStrLn $ "Оновлено: " ++ show n'
+  sayChanged "Оновлено" n'
 
 deleteSection :: Connection -> IO ()
 deleteSection conn = do
-  sid <- promptInt "ID секції для видалення"
-  n <- deleteEntity conn (Section (Just sid) "" "" Nothing)
-  putStrLn $ "Видалено: " ++ show n
+  sid <- promptInt "Вкажіть ID секції для видалення"
+  ok <- confirm ("Видалити секцію #" <> show sid <> "?")
+  if ok
+    then do n <- deleteEntity conn (Section (Just sid) "" "" Nothing)
+            sayChanged "Видалено" n
+    else putStrLn "Скасовано."
 
 -- SCHEDULE
 addSchedule :: Connection -> IO ()
 addSchedule conn = do
-  sec  <- promptInt "section_id"
+  sec  <- promptInt "Вкажіть ID секції"
   w    <- promptWeekday
-  st   <- readTimeOfDay "Початок (start_time)"
-  en   <- readTimeOfDay "Кінець (end_time)"
+  st   <- readTimeOfDay "Початок"
+  en   <- readTimeOfDay "Кінець"
   loc  <- T.pack <$> prompt "Локація"
   n <- insertEntity conn (Schedule Nothing sec w st en loc)
-  putStrLn $ "Додано рядків розкладу: " ++ show n
+  sayChanged "Додано рядків розкладу" n
 
 viewSchedules :: Connection -> IO ()
 viewSchedules conn = do
-  xs <- selectAll conn (Schedule Nothing 0 "" (TimeOfDay 0 0 0) (TimeOfDay 0 0 0) "")
-  mapM_ (TIO.putStrLn . prettySchedule) xs
+  rows <- query_ conn
+    "SELECT ss.schedule_id, sec.name, ss.weekday::text, \
+    \       to_char(ss.start_time,'HH24:MI'), to_char(ss.end_time,'HH24:MI'), ss.location \
+    \FROM section_schedule ss \
+    \JOIN sections sec ON sec.section_id = ss.section_id \
+    \ORDER BY sec.name, \
+    \CASE ss.weekday WHEN 'Пн' THEN 1 WHEN 'Вт' THEN 2 WHEN 'Ср' THEN 3 \
+    \WHEN 'Чт' THEN 4 WHEN 'Пт' THEN 5 WHEN 'Сб' THEN 6 WHEN 'Нд' THEN 7 END, \
+    \ss.start_time"
+      :: IO [(Int, Text, Text, Text, Text, Text)]
+  withHeader "Розклад (сорт: секція → день → час)" $ do
+    sayEmptyIf (null rows)
+    let headers = ["ID","Секція","День","Час","Локація"]
+        rows'   = [ [ T.pack (show sid)
+                    , sname
+                    , w
+                    , st <> "–" <> en
+                    , loc
+                    ]
+                  | (sid, sname, w, st, en, loc) <- rows
+                  ]
+    printTable headers rows'
 
 updateSchedule :: Connection -> IO ()
 updateSchedule conn = do
-  sid <- promptInt "ID запису розкладу для оновлення"
-  sec <- promptInt "Новий section_id"
+  sid <- promptInt "Вкажіть ID запису розкладу для оновлення"
+  sec <- promptInt "Новий ID секції"
   w   <- promptWeekday
-  st  <- readTimeOfDay "Новий початок (start_time)"
-  en  <- readTimeOfDay "Новий кінець (end_time)"
+  st  <- readTimeOfDay "Новий початок"
+  en  <- readTimeOfDay "Новий кінець"
   loc <- T.pack <$> prompt "Нова локація"
   n <- updateEntity conn (Schedule (Just sid) sec w st en loc)
-  putStrLn $ "Оновлено: " ++ show n
+  sayChanged "Оновлено" n
 
 deleteSchedule :: Connection -> IO ()
 deleteSchedule conn = do
-  sid <- promptInt "ID запису розкладу для видалення"
-  n <- deleteEntity conn (Schedule (Just sid) 0 "" (TimeOfDay 0 0 0) (TimeOfDay 0 0 0) "")
-  putStrLn $ "Видалено: " ++ show n
+  sid <- promptInt "Вкажіть ID запису розкладу для видалення"
+  ok <- confirm ("Видалити запис розкладу #" <> show sid <> "?")
+  if ok
+    then do n <- deleteEntity conn (Schedule (Just sid) 0 "" (TimeOfDay 0 0 0) (TimeOfDay 0 0 0) "")
+            sayChanged "Видалено" n
+    else putStrLn "Скасовано."
 
 -- MEMBERSHIP
 addMembership :: Connection -> IO ()
 addMembership conn = do
-  sid <- promptInt "student_id"
-  sc  <- promptInt "section_id"
+  sid <- promptInt "Вкажіть ID студента"
+  sc  <- promptInt "Вкажіть ID секції"
   jd  <- promptDay "Дата вступу"
   n <- insertEntity conn (Membership Nothing sid sc jd)
-  putStrLn $ "Додано членств: " ++ show n
+  sayChanged "Додано членств" n
 
 viewMemberships :: Connection -> IO ()
 viewMemberships conn = do
-  xs <- selectAll conn (Membership Nothing 0 0 (read "2000-01-01"))
-  mapM_ (TIO.putStrLn . prettyMembership) xs
+  rows <- query_ conn
+    "SELECT m.membership_id, \
+    \       (s.last_name || ' ' || s.first_name) AS student_name, \
+    \       sec.name AS section_name, \
+    \       m.joined_at \
+    \FROM memberships m \
+    \JOIN students   s   ON s.student_id = m.student_id \
+    \JOIN sections   sec ON sec.section_id = m.section_id \
+    \ORDER BY m.membership_id DESC"
+      :: IO [(Int, Text, Text, Day)]
+  withHeader "Членства (новіші зверху)" $ do
+    sayEmptyIf (null rows)
+    let headers = ["ID","Студент","Секція","Вступ"]
+        rows'   = [ [ T.pack (show mid), sname, secname, T.pack (show d) ]
+                  | (mid, sname, secname, d) <- rows
+                  ]
+    printTable headers rows'
 
 updateMembership :: Connection -> IO ()
 updateMembership conn = do
-  mid <- promptInt "ID членства для оновлення"
-  sid <- promptInt "Новий student_id"
-  sc  <- promptInt "Новий section_id"
+  mid <- promptInt "Вкажіть ID членства для оновлення"
+  sid <- promptInt "Новий ID студента"
+  sc  <- promptInt "Новий ID секції"
   jd  <- promptDay "Нова дата вступу"
   n <- updateEntity conn (Membership (Just mid) sid sc jd)
-  putStrLn $ "Оновлено: " ++ show n
+  sayChanged "Оновлено" n
 
 deleteMembership :: Connection -> IO ()
 deleteMembership conn = do
-  mid <- promptInt "ID членства для видалення"
-  n <- deleteEntity conn (Membership (Just mid) 0 0 (read "2000-01-01"))
-  putStrLn $ "Видалено: " ++ show n
+  mid <- promptInt "Вкажіть ID членства для видалення"
+  ok <- confirm ("Видалити членство #" <> show mid <> "?")
+  if ok
+    then do n <- deleteEntity conn (Membership (Just mid) 0 0 dummyDay)
+            sayChanged "Видалено" n
+    else putStrLn "Скасовано."
 
 -- COMPETITION
 addCompetition :: Connection -> IO ()
@@ -633,68 +772,102 @@ addCompetition conn = do
   t  <- T.pack <$> prompt "Назва змагань"
   d  <- promptDay "Дата проведення"
   v  <- T.pack <$> prompt "Місце проведення"
-  ms <- promptMaybeInt "section_id"
+  ms <- promptMaybeInt "ID секції (Enter = NULL)"
   n <- insertEntity conn (Competition Nothing t d v ms)
-  putStrLn $ "Додано змагань: " ++ show n
+  sayChanged "Додано змагань" n
 
 viewCompetitions :: Connection -> IO ()
 viewCompetitions conn = do
-  xs <- selectAll conn (Competition Nothing "" (read "2000-01-01") "" Nothing)
-  mapM_ (TIO.putStrLn . prettyCompetition) xs
+  rows <- query_ conn
+    "SELECT c.competition_id, c.title, c.held_on, c.venue, \
+    \       COALESCE(sec.name, '—') AS section_name \
+    \FROM competitions c \
+    \LEFT JOIN sections sec ON sec.section_id = c.section_id \
+    \ORDER BY c.held_on DESC"
+      :: IO [(Int, Text, Day, Text, Text)]
+  withHeader "Змагання (новіші зверху)" $ do
+    sayEmptyIf (null rows)
+    let headers = ["ID","Назва","Дата","Місце","Секція"]
+        rows'   = [ [ T.pack (show cid), title, T.pack (show heldOn), venue, secName ]
+                  | (cid, title, heldOn, venue, secName) <- rows
+                  ]
+    printTable headers rows'
 
 updateCompetition :: Connection -> IO ()
 updateCompetition conn = do
-  cid <- promptInt "ID змагань для оновлення"
+  cid <- promptInt "Вкажіть ID змагань для оновлення"
   t   <- T.pack <$> prompt "Нова назва"
   d   <- promptDay "Нова дата"
   v   <- T.pack <$> prompt "Нове місце"
-  ms  <- promptMaybeInt "Новий section_id"
+  ms  <- promptMaybeInt "Новий ID секції (Enter = NULL)"
   n <- updateEntity conn (Competition (Just cid) t d v ms)
-  putStrLn $ "Оновлено: " ++ show n
+  sayChanged "Оновлено" n
 
 deleteCompetition :: Connection -> IO ()
 deleteCompetition conn = do
-  cid <- promptInt "ID змагань для видалення"
-  n <- deleteEntity conn (Competition (Just cid) "" (read "2000-01-01") "" Nothing)
-  putStrLn $ "Видалено: " ++ show n
+  cid <- promptInt "Вкажіть ID змагань для видалення"
+  ok <- confirm ("Видалити змагання #" <> show cid <> "?")
+  if ok
+    then do n <- deleteEntity conn (Competition (Just cid) "" dummyDay "" Nothing)
+            sayChanged "Видалено" n
+    else putStrLn "Скасовано."
 
 -- COMPETITION PARTICIPANTS
 addCompetitionParticipant :: Connection -> IO ()
 addCompetitionParticipant conn = do
-  cid   <- promptInt "competition_id"
-  sid   <- promptInt "student_id"
-  notes <- T.pack <$> prompt "Примітки до результату (Enter=порожньо)"
+  cid   <- promptInt "Вкажіть ID змагань"
+  sid   <- promptInt "Вкажіть ID студента"
+  notes <- T.pack <$> prompt "Примітки до результату (Enter = NULL)"
   let nVal = if T.null notes then Nothing else Just notes
   n <- insertEntity conn (CompetitionParticipant Nothing cid sid nVal)
-  putStrLn $ "Додано учасників: " ++ show n
+  sayChanged "Додано учасників" n
 
 viewCompetitionParticipants :: Connection -> IO ()
 viewCompetitionParticipants conn = do
-  xs <- selectAll conn (CompetitionParticipant Nothing 0 0 Nothing)
-  mapM_ (TIO.putStrLn . prettyCompetitionParticipant) xs
+  rows <- query_ conn
+    "SELECT cp.cp_id, \
+    \       c.title AS competition_title, \
+    \       (s.last_name || ' ' || s.first_name) AS student_name, \
+    \       cp.result_notes \
+    \FROM competition_participants cp \
+    \JOIN competitions c ON c.competition_id = cp.competition_id \
+    \JOIN students     s ON s.student_id     = cp.student_id \
+    \ORDER BY cp.cp_id"
+      :: IO [(Int, Text, Text, Maybe Text)]
+  withHeader "Учасники змагань" $ do
+    sayEmptyIf (null rows)
+    let headers = ["ID","Змагання","Студент","Нотатки"]
+        rows'   = [ [ T.pack (show cid), ctitle, sname, maybe "—" id notes ]
+                  | (cid, ctitle, sname, notes) <- rows
+                  ]
+    printTable headers rows'
 
 updateCompetitionParticipant :: Connection -> IO ()
 updateCompetitionParticipant conn = do
-  cpid  <- promptInt "ID (cp_id) учасника для оновлення"
-  cid   <- promptInt "Новий competition_id"
-  sid   <- promptInt "Новий student_id"
-  notes <- T.pack <$> prompt "Нові примітки (Enter=порожньо)"
+  cpid  <- promptInt "Вкажіть ID учасника"
+  cid   <- promptInt "Новий ID змагань"
+  sid   <- promptInt "Новий ID студента"
+  notes <- T.pack <$> prompt "Нові примітки (Enter = NULL)"
   let nVal = if T.null notes then Nothing else Just notes
   n <- updateEntity conn (CompetitionParticipant (Just cpid) cid sid nVal)
-  putStrLn $ "Оновлено: " ++ show n
+  sayChanged "Оновлено" n
 
 deleteCompetitionParticipant :: Connection -> IO ()
 deleteCompetitionParticipant conn = do
-  cpid <- promptInt "ID (cp_id) учасника для видалення"
-  n <- deleteEntity conn (CompetitionParticipant (Just cpid) 0 0 Nothing)
-  putStrLn $ "Видалено: " ++ show n
+  cpid <- promptInt "Вкажіть ID учасника для видалення"
+  ok <- confirm ("Видалити учасника #" <> show cpid <> "?")
+  if ok
+    then do n <- deleteEntity conn (CompetitionParticipant (Just cpid) 0 0 Nothing)
+            sayChanged "Видалено" n
+    else putStrLn "Скасовано."
 
-showCompetitionParticipantsPretty :: Connection -> IO ()
-showCompetitionParticipantsPretty conn = do
-  cid <- promptInt "competition_id"
+showCompetitionParticipants :: Connection -> IO ()
+showCompetitionParticipants conn = do
+  cid <- promptInt "Вкажіть ID змагань"
   rows <- listCompetitionParticipants conn cid
-  mapM_ (\(title, student) ->
-          putStrLn (T.unpack title ++ " <- " ++ T.unpack student)) rows
+  withHeader ("Учасники змагання · ID = " <> T.pack (show cid)) $ do
+    sayEmptyIf (null rows)
+    mapM_ (\(title, student) -> TIO.putStrLn (title <> " ← " <> student)) rows
 
 --------------------------------------------------------------------------------
 -- CLI-МЕНЮ
@@ -702,10 +875,16 @@ showCompetitionParticipantsPretty conn = do
 
 main :: IO ()
 main = do
-  putStrLn "Спорт на факультеті"
-  conn <- createConn
-  runMigrations conn
-  loop conn
+  res <- try $ bracket createConn close $ \conn -> do
+    ansi <- hSupportsANSI stdout
+    when ansi (setSGR [SetColor Foreground Vivid Green, SetConsoleIntensity BoldIntensity])
+    putStrLn "Спорт на факультеті"
+    when ansi (setSGR [Reset])
+    runMigrations conn
+    loop conn
+  case (res :: Either SomeException ()) of
+    Left e  -> putStrLn $ "Помилка БД/IO: " ++ show e
+    Right _ -> pure ()
 
 loop :: Connection -> IO ()
 loop conn = do
@@ -722,11 +901,11 @@ loop conn = do
   putStrLn "19) Оновити розклад            20) Видалити розклад"
   putStrLn "21) Оновити членство           22) Видалити членство"
   putStrLn "23) Оновити змагання           24) Видалити змагання"
-  putStrLn "25) Показати студент -> секції"
-  putStrLn "26) Показати розклад секції (ID)"
+  putStrLn "25) Показати студент → секції"
+  putStrLn "26) Показати розклад секції (за ID секції)"
   putStrLn "27) Додати учасника змагань    28) Переглянути учасників"
   putStrLn "29) Оновити учасника           30) Видалити учасника"
-  putStrLn "31) Показати учасників змагання (за competition_id)"
+  putStrLn "31) Показати учасників змагання (за ID змагання)"
   putStrLn "0)  Вихід"
   putStr   "Ваш вибір: " >> hFlush stdout
   ch <- getLine
@@ -757,17 +936,25 @@ loop conn = do
     "24" -> deleteCompetition conn >> loop conn
     "25" -> do
               pairs <- listStudentSections conn
-              mapM_ (\(s,sec) -> putStrLn (T.unpack s ++ " -> " ++ T.unpack sec)) pairs
+              withHeader "Студент → Секції" $ do
+                sayEmptyIf (null pairs)
+                let headers = ["Студент","Секція"]
+                    rows    = [ [s, sec] | (s, sec) <- pairs ]
+                printTable headers rows
               loop conn
     "26" -> do
-              sid <- promptInt "section_id"
+              sid <- promptInt "Вкажіть ID секції"
               rows <- getSectionSchedule conn sid
-              mapM_ (\(w,st,en) -> putStrLn (T.unpack w ++ " " ++ T.unpack st ++ "-" ++ T.unpack en)) rows
+              withHeader ("Розклад секції #" <> T.pack (show sid)) $ do
+                sayEmptyIf (null rows)
+                let headers = ["День","Початок","Кінець"]
+                    rows'   = [ [w, st, en] | (w,st,en) <- rows ]
+                printTable headers rows'
               loop conn
     "27" -> addCompetitionParticipant conn >> loop conn
     "28" -> viewCompetitionParticipants conn >> loop conn
     "29" -> updateCompetitionParticipant conn >> loop conn
     "30" -> deleteCompetitionParticipant conn >> loop conn
-    "31" -> showCompetitionParticipantsPretty conn >> loop conn
+    "31" -> showCompetitionParticipants conn >> loop conn
     "0"  -> putStrLn "До побачення!"
-    _    -> putStrLn "Невірний вибір" >> loop conn
+    _    -> putStrLn "Невірний вибір (тисни 0–31)." >> loop conn
