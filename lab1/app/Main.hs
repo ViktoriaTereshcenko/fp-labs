@@ -12,6 +12,7 @@ import           Data.Time (Day, defaultTimeLocale, parseTimeM)
 import           Data.Time.LocalTime (TimeOfDay(..))
 import           Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
 import qualified Data.ByteString as SBS
 import           GHC.Generics (Generic)
 
@@ -149,6 +150,7 @@ class Persist a where
   deleteSQL    :: a -> Query
   getKey       :: a -> Maybe (Key a)
 
+-- Student
 instance Persist Student where
   type Key Student = Int
   tableName _     = "students"
@@ -158,6 +160,7 @@ instance Persist Student where
   deleteSQL _     = "DELETE FROM students WHERE student_id=?"
   getKey          = stId
 
+-- Instructor
 instance Persist Instructor where
   type Key Instructor = Int
   tableName _     = "instructors"
@@ -167,6 +170,7 @@ instance Persist Instructor where
   deleteSQL _     = "DELETE FROM instructors WHERE instructor_id=?"
   getKey          = insId
 
+-- Section
 instance Persist Section where
   type Key Section = Int
   tableName _     = "sections"
@@ -176,6 +180,7 @@ instance Persist Section where
   deleteSQL _     = "DELETE FROM sections WHERE section_id=?"
   getKey          = secId
 
+-- Schedule
 instance Persist Schedule where
   type Key Schedule = Int
   tableName _     = "section_schedule"
@@ -191,6 +196,7 @@ instance Persist Schedule where
   deleteSQL _     = "DELETE FROM section_schedule WHERE schedule_id=?"
   getKey          = schId
 
+-- Membership
 instance Persist Membership where
   type Key Membership = Int
   tableName _     = "memberships"
@@ -200,6 +206,7 @@ instance Persist Membership where
   deleteSQL _     = "DELETE FROM memberships WHERE membership_id=?"
   getKey          = memId
 
+-- Competition
 instance Persist Competition where
   type Key Competition = Int
   tableName _     = "competitions"
@@ -209,6 +216,7 @@ instance Persist Competition where
   deleteSQL _     = "DELETE FROM competitions WHERE competition_id=?"
   getKey          = cmpId
 
+-- CompetitionParticipant
 instance Persist CompetitionParticipant where
   type Key CompetitionParticipant = Int
   tableName _     = "competition_participants"
@@ -237,6 +245,76 @@ deleteEntity conn x = case getKey x of
 
 selectAll :: (Persist a, FromRow a) => Connection -> a -> IO [a]
 selectAll conn proxy = query_ conn (selectAllSQL proxy)
+
+--------------------------------------------------------------------------------
+-- PRETTY-ВИВІД (для коректного UTF-8 замість Show-escape)
+--------------------------------------------------------------------------------
+
+prettyStudent :: Student -> Text
+prettyStudent s =
+  T.intercalate " | "
+    [ "ID: " <> maybe "-" (T.pack . show) (stId s)
+    , "ПІБ: " <> stLastName s <> " " <> stFirstName s
+    , "Група: " <> stGroup s
+    , "Нар.: " <> T.pack (show (stBirth s))
+    , "Тел: " <> maybe "" id (stPhone s)
+    ]
+
+prettyInstructor :: Instructor -> Text
+prettyInstructor i =
+  T.intercalate " | "
+    [ "ID: " <> maybe "-" (T.pack . show) (insId i)
+    , "ПІБ: " <> insLastName i <> " " <> insFirstName i
+    , "Кафедра: " <> insDept i
+    , "Тел: " <> maybe "" id (insPhone i)
+    ]
+
+prettySection :: Section -> Text
+prettySection s =
+  T.intercalate " | "
+    [ "ID: " <> maybe "-" (T.pack . show) (secId s)
+    , "Назва: " <> secName s
+    , "Рівень: " <> secLevel s
+    , "Викл.ID: " <> maybe "-" (T.pack . show) (secInstructor s)
+    ]
+
+prettySchedule :: Schedule -> Text
+prettySchedule s =
+  T.intercalate " | "
+    [ "ID: " <> maybe "-" (T.pack . show) (schId s)
+    , "Секція: " <> T.pack (show (schSection s))
+    , "День: " <> schWeekday s
+    , "Час: " <> T.pack (show (schStart s)) <> "-" <> T.pack (show (schEnd s))
+    , "Локація: " <> schLoc s
+    ]
+
+prettyMembership :: Membership -> Text
+prettyMembership m =
+  T.intercalate " | "
+    [ "ID: " <> maybe "-" (T.pack . show) (memId m)
+    , "СтудентID: " <> T.pack (show (memStudent m))
+    , "СекціяID: " <> T.pack (show (memSection m))
+    , "Вступ: " <> T.pack (show (memJoined m))
+    ]
+
+prettyCompetition :: Competition -> Text
+prettyCompetition c =
+  T.intercalate " | "
+    [ "ID: " <> maybe "-" (T.pack . show) (cmpId c)
+    , "Назва: " <> cmpTitle c
+    , "Дата: " <> T.pack (show (cmpHeldOn c))
+    , "Місце: " <> cmpVenue c
+    , "СекціяID: " <> maybe "-" (T.pack . show) (cmpSection c)
+    ]
+
+prettyCompetitionParticipant :: CompetitionParticipant -> Text
+prettyCompetitionParticipant cp =
+  T.intercalate " | "
+    [ "ID: " <> maybe "-" (T.pack . show) (cpId cp)
+    , "ЗмаганняID: " <> T.pack (show (cpCompetition cp))
+    , "СтудентID: " <> T.pack (show (cpStudent cp))
+    , "Нотатки: " <> maybe "" id (cpResultNotes cp)
+    ]
 
 --------------------------------------------------------------------------------
 -- СПЕЦІАЛЬНІ ЗАПИТИ (JOIN-и)
@@ -390,7 +468,7 @@ addStudent conn = do
 viewStudents :: Connection -> IO ()
 viewStudents conn = do
   xs <- selectAll conn (Student Nothing "" "" "" (read "2000-01-01") Nothing)
-  mapM_ print xs
+  mapM_ (TIO.putStrLn . prettyStudent) xs
 
 updateStudent :: Connection -> IO ()
 updateStudent conn = do
@@ -424,7 +502,7 @@ addInstructor conn = do
 viewInstructors :: Connection -> IO ()
 viewInstructors conn = do
   xs <- selectAll conn (Instructor Nothing "" "" "" Nothing)
-  mapM_ print xs
+  mapM_ (TIO.putStrLn . prettyInstructor) xs
 
 updateInstructor :: Connection -> IO ()
 updateInstructor conn = do
@@ -455,7 +533,7 @@ addSection conn = do
 viewSections :: Connection -> IO ()
 viewSections conn = do
   xs <- selectAll conn (Section Nothing "" "" Nothing)
-  mapM_ print xs
+  mapM_ (TIO.putStrLn . prettySection) xs
 
 updateSection :: Connection -> IO ()
 updateSection conn = do
@@ -487,7 +565,7 @@ addSchedule conn = do
 viewSchedules :: Connection -> IO ()
 viewSchedules conn = do
   xs <- selectAll conn (Schedule Nothing 0 "" (TimeOfDay 0 0 0) (TimeOfDay 0 0 0) "")
-  mapM_ print xs
+  mapM_ (TIO.putStrLn . prettySchedule) xs
 
 updateSchedule :: Connection -> IO ()
 updateSchedule conn = do
@@ -518,7 +596,7 @@ addMembership conn = do
 viewMemberships :: Connection -> IO ()
 viewMemberships conn = do
   xs <- selectAll conn (Membership Nothing 0 0 (read "2000-01-01"))
-  mapM_ print xs
+  mapM_ (TIO.putStrLn . prettyMembership) xs
 
 updateMembership :: Connection -> IO ()
 updateMembership conn = do
@@ -548,7 +626,7 @@ addCompetition conn = do
 viewCompetitions :: Connection -> IO ()
 viewCompetitions conn = do
   xs <- selectAll conn (Competition Nothing "" (read "2000-01-01") "" Nothing)
-  mapM_ print xs
+  mapM_ (TIO.putStrLn . prettyCompetition) xs
 
 updateCompetition :: Connection -> IO ()
 updateCompetition conn = do
@@ -579,7 +657,7 @@ addCompetitionParticipant conn = do
 viewCompetitionParticipants :: Connection -> IO ()
 viewCompetitionParticipants conn = do
   xs <- selectAll conn (CompetitionParticipant Nothing 0 0 Nothing)
-  mapM_ print xs
+  mapM_ (TIO.putStrLn . prettyCompetitionParticipant) xs
 
 updateCompetitionParticipant :: Connection -> IO ()
 updateCompetitionParticipant conn = do
