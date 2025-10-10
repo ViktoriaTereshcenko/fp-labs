@@ -12,6 +12,7 @@ import           Data.Time (Day, defaultTimeLocale, parseTimeM)
 import           Data.Time.LocalTime (TimeOfDay(..))
 import           Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import qualified Data.ByteString as SBS
 import           GHC.Generics (Generic)
@@ -357,8 +358,21 @@ runMigrations :: Connection -> IO ()
 runMigrations conn = do
   ok <- doesFileExist "db.sql"
   when ok $ do
-      sql <- SBS.readFile "db.sql"
-      withTransaction conn $ void (execute_ conn (Query sql))
+    raw <- SBS.readFile "db.sql"
+    let txt = TE.decodeUtf8 raw
+        -- прибираємо все, що не можна всередині транзакції
+        isForbidden s =
+          let s' = T.toCaseFold (T.strip s)
+          in  T.isPrefixOf "create database" s'
+           || T.isPrefixOf "\\connect" (T.strip s)
+           || T.isPrefixOf "\\c"       (T.strip s)
+           || s' == "begin;"
+           || s' == "commit;"
+        cleaned = T.unlines (filter (not . isForbidden) (T.lines txt))
+    -- виконуємо тільки якщо щось лишилось
+    when (not (T.null (T.strip cleaned))) $
+      withTransaction conn $
+        void (execute_ conn (Query (TE.encodeUtf8 cleaned)))
 
 --------------------------------------------------------------------------------
 -- ПІДКЛЮЧЕННЯ ДО PostgreSQL
@@ -374,10 +388,10 @@ readEnvPort key def = do
 
 createConn :: IO Connection
 createConn = do
-  host <- readEnv "PGHOST"     "127.0.0.1"
-  port <- readEnvPort "PGPORT" 5432
-  user <- readEnv "PGUSER"     "vikilinater"
-  pass <- readEnv "PGPASSWORD" "admin"
+  host <- readEnv "PGHOST"     "localhost"
+  port <- readEnvPort "PGPORT" 6969
+  user <- readEnv "PGUSER"     "postgres"
+  pass <- readEnv "PGPASSWORD" "22112004"
   db   <- readEnv "PGDATABASE" "faculty_sport"
   connect defaultConnectInfo
     { connectHost     = host
