@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cabal v2-clean || true
-
+# конфіг Homebrew (ARM64)
 export PATH="/opt/homebrew/opt/libpq/bin:/opt/homebrew/bin:$PATH"
 export PKG_CONFIG_PATH="/opt/homebrew/opt/libpq/lib/pkgconfig:/opt/homebrew/opt/openssl@3/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
@@ -15,4 +14,11 @@ export LIBRARY_PATH="/opt/homebrew/opt/libpq/lib:/opt/homebrew/opt/openssl@3/lib
 # для лінкування під час виконання
 export DYLD_LIBRARY_PATH="/opt/homebrew/opt/libpq/lib:/opt/homebrew/opt/openssl@3/lib:${DYLD_LIBRARY_PATH:-}"
 
-cabal v2-build -v1
+cabal clean || true
+cabal build -v1
+
+# опційний запуск (./build.sh run)
+if [[ "${1-}" == "run" ]]; then
+  echo "Запуск"
+  cabal run
+fi
